@@ -137,17 +137,12 @@ python main.py --config cfgs/PCN_models/SymmCompletion.yaml \
 
 ---
 
-## Pretrained Models
 
-Pretrained checkpoints are available at [Google Drive](https://drive.google.com/drive/folders/1JRdZvdEuPDzXbiLTTvt3pYjGC3Yj3z6p?usp=drive_link).
-
----
 
 ## Acknowledgements
 
 This work is built on top of the following projects:
 
-- **[SymmCompletion (HarishValliappan)](https://github.com/HarishValliappan/SymmCompletion)** — adapted codebase used as the base for Symm3dTri
 - **[SymmCompletion (original, AAAI 2025)](https://github.com/HongyuYann/SymmCompletion)** — Hongyu Yan et al., *SymmCompletion: High-Fidelity and High-Consistency Point Cloud Completion with Symmetry Guidance*
 - [AnchorFormer](https://github.com/chenzhik/AnchorFormer)
 - [PoinTr](https://github.com/yuxumin/PoinTr)
