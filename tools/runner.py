@@ -14,6 +14,27 @@ from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 from models.model_utils import fps_subsample
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _build_optimizer_scheduler(params, opti_config, sche_config):
+    if opti_config.type == 'AdamW':
+        optimizer = torch.optim.AdamW(params, **opti_config.kwargs)
+    elif opti_config.type == 'Adam':
+        optimizer = torch.optim.Adam(params, **opti_config.kwargs)
+    elif opti_config.type == 'SGD':
+        optimizer = torch.optim.SGD(params, nesterov=True, **opti_config.kwargs)
+    else:
+        raise NotImplementedError()
+
+    if sche_config.type == 'LambdaLR':
+        scheduler = misc.build_lambda_sche(optimizer, sche_config.kwargs)
+    elif sche_config.type == 'StepLR':
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, **sche_config.kwargs)
+    elif sche_config.type == 'WarmUpCosLR':
+        scheduler = misc.build_warm_cos_sche(optimizer, sche_config.kwargs)
+    else:
+        raise NotImplementedError()
+    return optimizer, scheduler
+
 def run_net(args, config, train_writer=None, val_writer=None):
     logger = get_logger(args.log_name)
     # Build Dataset
@@ -52,14 +73,39 @@ def run_net(args, config, train_writer=None, val_writer=None):
         base_model = nn.DataParallel(base_model).cuda()
         
     # Optimizer & Scheduler
-    optimizer, scheduler = builder.build_opti_sche(base_model, config)
+    model_ref = base_model.module if hasattr(base_model, 'module') else base_model
+    gan_enabled = bool(getattr(model_ref, 'use_gan', False))
+    optimizer_d, scheduler_d = None, None
+
+    if gan_enabled:
+        print_log('GAN training enabled: using separate optimizers for G and D.', logger=logger)
+        g_params = [
+            p for n, p in model_ref.named_parameters()
+            if not n.startswith('discriminator.')
+        ]
+        d_params = list(model_ref.discriminator.parameters())
+
+        optimizer, scheduler = _build_optimizer_scheduler(
+            g_params, config.optimizer, config.scheduler)
+
+        opti_d_cfg = getattr(config, 'optimizer_d', None)
+        sche_d_cfg = getattr(config, 'scheduler_d', None)
+        if opti_d_cfg is None:
+            opti_d_cfg = config.optimizer
+        if sche_d_cfg is None:
+            sche_d_cfg = config.scheduler
+
+        optimizer_d, scheduler_d = _build_optimizer_scheduler(
+            d_params, opti_d_cfg, sche_d_cfg)
+    else:
+        optimizer, scheduler = builder.build_opti_sche(base_model, config)
     
     # Criterion
     ChamferDisL1 = ChamferDistanceL1()
     ChamferDisL2 = ChamferDistanceL2()
 
     if args.resume:
-        builder.resume_optimizer(optimizer, args, logger = logger)
+        builder.resume_optimizer(optimizer, args, logger=logger, optimizer_d=optimizer_d)
 
     # Training
     base_model.zero_grad()
@@ -72,7 +118,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
         batch_start_time = time.time()
         batch_time = AverageMeter()
         data_time = AverageMeter()
-        losses = AverageMeter(['SparseLoss', 'DenseLoss', 'SparsePenalty', 'DensePenalty'])
+        if gan_enabled:
+            losses = AverageMeter(['SparseLoss', 'DenseLoss', 'SparsePenalty', 'DensePenalty', 'GenAdv', 'Disc'])
+        else:
+            losses = AverageMeter(['SparseLoss', 'DenseLoss', 'SparsePenalty', 'DensePenalty'])
 
         num_iter = 0
 
@@ -105,8 +154,22 @@ def run_net(args, config, train_writer=None, val_writer=None):
             num_iter += 1
            
             ret = base_model(partial)
-            
+
+            if gan_enabled:
+                optimizer_d.zero_grad()
+                disc_loss = base_model.module.get_discriminator_loss(ret[-1], gt)
+                disc_loss.backward()
+                optimizer_d.step()
+            else:
+                disc_loss = torch.zeros((), device=gt.device, dtype=gt.dtype)
+
             loss, sparse_loss, dense_loss, sparse_penalty, dense_penalty = base_model.module.get_loss(ret, gt)
+            if gan_enabled:
+                gen_adv = base_model.module.get_generator_adv_loss(ret[-1])
+                loss = loss + base_model.module.lambda_gan * gen_adv
+            else:
+                gen_adv = torch.zeros((), device=loss.device, dtype=loss.dtype)
+
             loss.backward()
 
             # Forward
@@ -120,11 +183,33 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 dense_loss = dist_utils.reduce_tensor(dense_loss, args)
                 sparse_penalty = dist_utils.reduce_tensor(sparse_penalty, args)
                 dense_penalty = dist_utils.reduce_tensor(dense_penalty, args)
-                losses.update([sparse_loss.item() * 1000, dense_loss.item() * 1000, \
-                               sparse_penalty.item() * 1000, dense_penalty.item() * 1000])
+                if gan_enabled:
+                    gen_adv = dist_utils.reduce_tensor(gen_adv, args)
+                    disc_loss = dist_utils.reduce_tensor(disc_loss, args)
+                    losses.update([
+                        sparse_loss.item() * 1000,
+                        dense_loss.item() * 1000,
+                        sparse_penalty.item() * 1000,
+                        dense_penalty.item() * 1000,
+                        gen_adv.item() * 1000,
+                        disc_loss.item() * 1000,
+                    ])
+                else:
+                    losses.update([sparse_loss.item() * 1000, dense_loss.item() * 1000, \
+                                   sparse_penalty.item() * 1000, dense_penalty.item() * 1000])
             else:
-                losses.update([sparse_loss.item() * 1000, dense_loss.item() * 1000, \
-                               sparse_penalty.item() * 1000, dense_penalty.item() * 1000])
+                if gan_enabled:
+                    losses.update([
+                        sparse_loss.item() * 1000,
+                        dense_loss.item() * 1000,
+                        sparse_penalty.item() * 1000,
+                        dense_penalty.item() * 1000,
+                        gen_adv.item() * 1000,
+                        disc_loss.item() * 1000,
+                    ])
+                else:
+                    losses.update([sparse_loss.item() * 1000, dense_loss.item() * 1000, \
+                                   sparse_penalty.item() * 1000, dense_penalty.item() * 1000])
 
 
             if args.distributed:
@@ -137,6 +222,9 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 train_writer.add_scalar('LR/training', optimizer.param_groups[0]['lr'], n_itr)
                 train_writer.add_scalar('Penalty/Batch/Sparse', sparse_penalty.item() * 1000, n_itr)
                 train_writer.add_scalar('Penalty/Batch/Dense', dense_penalty.item() * 1000, n_itr)
+                if gan_enabled:
+                    train_writer.add_scalar('Loss/Batch/GenAdv', gen_adv.item() * 1000, n_itr)
+                    train_writer.add_scalar('Loss/Batch/Disc', disc_loss.item() * 1000, n_itr)
 
             batch_time.update(time.time() - batch_start_time)
             batch_start_time = time.time()
@@ -150,6 +238,12 @@ def run_net(args, config, train_writer=None, val_writer=None):
                 item.step(epoch)
         else:
             scheduler.step(epoch)
+        if gan_enabled:
+            if isinstance(scheduler_d, list):
+                for item in scheduler_d:
+                    item.step(epoch)
+            else:
+                scheduler_d.step(epoch)
         epoch_end_time = time.time()
 
         if train_writer is not None:
@@ -157,6 +251,9 @@ def run_net(args, config, train_writer=None, val_writer=None):
             train_writer.add_scalar('Loss/Epoch/Dense', losses.avg(1), epoch)
             train_writer.add_scalar('Penalty/Epoch/Sparse', losses.avg(2), epoch)
             train_writer.add_scalar('Penalty/Epoch/Dense', losses.avg(3), epoch)
+            if gan_enabled:
+                train_writer.add_scalar('Loss/Epoch/GenAdv', losses.avg(4), epoch)
+                train_writer.add_scalar('Loss/Epoch/Disc', losses.avg(5), epoch)
         print_log('[Training] EPOCH: %d EpochTime = %.3f (s) Losses = %s' %
             (epoch,  epoch_end_time - epoch_start_time, ['%.4f' % l for l in losses.avg()]), logger = logger)
 
@@ -167,10 +264,10 @@ def run_net(args, config, train_writer=None, val_writer=None):
             # Save checkpoints
             if  metrics.better_than(best_metrics):
                 best_metrics = metrics
-                builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-best', args, logger = logger)
-        builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger = logger)      
+                builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-best', args, logger=logger, optimizer_d=optimizer_d)
+        builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, 'ckpt-last', args, logger=logger, optimizer_d=optimizer_d)
         if (config.max_epoch - epoch) < 10:
-            builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, f'ckpt-epoch-{epoch:03d}', args, logger = logger) 
+            builder.save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, f'ckpt-epoch-{epoch:03d}', args, logger=logger, optimizer_d=optimizer_d)
             
     if train_writer is not None: train_writer.close()
     if val_writer is not None: val_writer.close()

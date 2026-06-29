@@ -1,4 +1,4 @@
-#!/usr/bin/env sh
+
 HOME=`pwd`
 
 # Chamfer Distance
@@ -16,4 +16,3 @@ python setup.py install --user
 # Pointnet2
 cd $HOME/extensions/Pointnet2/pointnet2
 python setup.py install --user
-

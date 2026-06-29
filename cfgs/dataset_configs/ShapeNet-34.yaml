@@ -1,4 +1,4 @@
 NAME: ShapeNet
-DATA_PATH: ./data/ShapeNet55-34/ShapeNet-34
+DATA_PATH: /home/msai/harihara011/Symm3d/SymmCompletion/weights/shapenet34/ckpt-best.pth
 N_POINTS: 8192
 PC_PATH: /data/dataset/Completion/ShapeNet55/shapenet_pc

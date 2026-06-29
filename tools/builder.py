@@ -93,7 +93,7 @@ def resume_model(base_model, args, logger = None):
     print_log(f'[RESUME INFO] resume ckpts @ {start_epoch - 1} epoch( best_metrics = {str(best_metrics):s})', logger = logger)
     return start_epoch, best_metrics
 
-def resume_optimizer(optimizer, args, logger = None):
+def resume_optimizer(optimizer, args, logger = None, optimizer_d = None):
     ckpt_path = os.path.join(args.experiment_path, 'ckpt-last.pth')
     if not os.path.exists(ckpt_path):
         print_log(f'[RESUME INFO] no checkpoint file from path {ckpt_path}...', logger = logger)
@@ -103,16 +103,21 @@ def resume_optimizer(optimizer, args, logger = None):
     state_dict = torch.load(ckpt_path, map_location='cpu')
     # optimizer
     optimizer.load_state_dict(state_dict['optimizer'])
+    if optimizer_d is not None and state_dict.get('optimizer_d') is not None:
+        optimizer_d.load_state_dict(state_dict['optimizer_d'])
 
-def save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, prefix, args, logger = None):
+def save_checkpoint(base_model, optimizer, epoch, metrics, best_metrics, prefix, args, logger = None, optimizer_d = None):
     if args.local_rank == 0:
-        torch.save({
+        ckpt = {
                     'base_model' : base_model.module.state_dict() if args.distributed else base_model.state_dict(),
                     'optimizer' : optimizer.state_dict(),
                     'epoch' : epoch,
                     'metrics' : metrics.state_dict() if metrics is not None else dict(),
                     'best_metrics' : best_metrics.state_dict() if best_metrics is not None else dict(),
-                    }, os.path.join(args.experiment_path, prefix + '.pth'))
+                    }
+        if optimizer_d is not None:
+            ckpt['optimizer_d'] = optimizer_d.state_dict()
+        torch.save(ckpt, os.path.join(args.experiment_path, prefix + '.pth'))
         print_log(f"Save checkpoint at {os.path.join(args.experiment_path, prefix + '.pth')}", logger = logger)
 
 def load_model(base_model, ckpt_path, logger = None):
